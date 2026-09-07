@@ -339,6 +339,26 @@ static int headless_wait(VsInput *in, int *w, int *h) {
     }
 }
 
+/* The one monitor a machine with no window system still has to describe.
+   surface_monitors() must never come back empty — every caller indexes [0]
+   without guarding — so headless (and an X11 arm that cannot open a display)
+   answers with a synthetic screen rather than reporting nothing.
+   1920x1080 because a headless layout test wants a plausible desktop, not a
+   degenerate one; $VYTO_SCALE still decides the scale, matching what
+   vs_scale_pct() reports for a headless surface. */
+static int headless_monitors(VsMonitor *out, int max) {
+    if (max > 0 && out) {
+        out[0].x = 0;
+        out[0].y = 0;
+        out[0].w = 1920;
+        out[0].h = 1080;
+        out[0].primary = 1;
+        int sc = scale_from_env_at(0);
+        out[0].scale_pct = sc > 0 ? sc : 100;
+    }
+    return 1;
+}
+
 /* The six input accessors used to live here, reading file-scope statics. They
    now read per-surface fields, and VSurf is defined separately in each arm
    below — so the definitions moved down into the Win32 and X11 arms. See
@@ -801,6 +821,7 @@ int vs_capture(unsigned long win, int *out, int cap, int *w, int *h) {
 }
 
 int vs_monitors(VsMonitor *out, int max) {
+    if (headless_on()) return headless_monitors(out, max);
     VsMonEnum e;
     e.out = out;
     e.max = max;
@@ -2225,10 +2246,13 @@ int vs_capture(unsigned long win, int *out, int cap, int *w, int *h) {
 
 int vs_monitors(VsMonitor *out, int max) {
     if (!out) max = 0;   /* counting call: fill nothing, just report how many */
+    if (headless_on()) return headless_monitors(out, max);
     /* Open our own connection: this is a process-level query, and a caller may
        have no surface yet — placing a window before creating it is the point. */
     Display *dpy = XOpenDisplay(NULL);
-    if (!dpy) return 0;
+    /* No display server at all — fbdev, or a bare CI box. One synthetic screen
+       beats none: the contract is that this never returns zero monitors. */
+    if (!dpy) return headless_monitors(out, max);
     int scr = DefaultScreen(dpy);
     int count = 0;
 
