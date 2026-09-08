@@ -84,6 +84,8 @@ static int vs_startup(void) {
 
 #else
 
+#include <signal.h>
+
 typedef int vsock_t;
 #define VS_FD(fd)        (fd)
 #define VS_INT(s)        (s)
@@ -96,7 +98,34 @@ typedef int vsock_t;
 typedef socklen_t vs_socklen_t;
 typedef size_t vs_iolen_t;
 
-static int vs_startup(void) { return 0; }
+/* POSIX needs no socket init, but it does need SIGPIPE gone.
+
+   send() is already covered -- every call here passes MSG_NOSIGNAL. sendfile(2)
+   is NOT: it has no such flag, and SIGPIPE's default disposition is to
+   TERMINATE. So a client that aborts a large download kills the whole worker
+   and every connection on it, silently, with exit status 141.
+
+   That is not a theoretical hazard. It is reproducible in about a second:
+   serve a 20 MB file, start the download, hang up. The server dies. It went
+   unnoticed because it needs three things at once -- sendfile, a body too big
+   to leave in one call, and a client that disconnects early -- and no test
+   ever combined them.
+
+   Ignoring the signal is the standard answer for a server: the failed write
+   still returns EPIPE, which the reactor already treats as a dead connection
+   (Conn.flush, server.vt). Nothing else in the process wants SIGPIPE either --
+   a program that pipes into head(1) is not what this runtime is for.
+
+   Done here rather than in server.vt because it is the socket layer's business
+   and every sendfile user needs it, not just the pre-fork server. Called from
+   every entry point that can be the first socket call in a program. */
+static int vs_startup(void) {
+    static int done = 0;
+    if (done) return 0;
+    signal(SIGPIPE, SIG_IGN);
+    done = 1;
+    return 0;
+}
 
 #endif
 
