@@ -1,0 +1,54 @@
+// str() on a value that is already a string is a no-op conversion: it hands
+// back the same object. It must not be reported as a fresh (+1) result, or the
+// caller releases a reference it never took and the owner's field dangles.
+//
+// The same trap applies to any expression that yields a reference it does not
+// own, so the rest of this file exercises the other aliasing paths — upcasts,
+// checked downcasts, element and map reads, array/map locals bound to a field,
+// and a captured field — all re-read after the alias has gone out of scope.
+
+class Base { tag: string; fn init(t: string) { this.tag = t; } }
+class Derived extends Base { fn init(t: string) { super.init(t); } }
+
+class Bag {
+    s: string;
+    xs: string[];
+    m: Map<string, string>;
+    d: Derived;
+    fn init(s: string, xs: string[], m: Map<string, string>, d: Derived) {
+        this.s = s; this.xs = xs; this.m = m; this.d = d;
+    }
+}
+
+fn take(s: string): int { return s.len; }
+
+fn main() {
+    // Built strings, not literals: a literal is immortal (rc = -1), so a
+    // spurious release on one is a no-op and hides the bug entirely.
+    let xs: string[] = ["a" + "1", "b" + "2"];
+    let m = new Map<string, string>();
+    m.set("k" + "1", "v" + "1");
+    let b = new Bag("he" + "llo", xs, m, new Derived("t" + "ag"));
+
+    for (let i in 0..3) {
+        print(str(b.s));                  // identity conversion on a field
+        let up = b.d as Base;             // upcast: same object, borrowed
+        print(up.tag);
+        print((up as Derived).tag);       // checked downcast back
+        print(b.xs[0]);                   // borrowed element read
+        print(b.m.get("k1"));             // borrowed map read
+        print(str(take(b.s)));            // field as argument, then re-read
+        let alias = b.xs;                 // local bound to an owned field
+        print(alias[1]);
+        let f: fn(): string = () => b.s;  // captured field
+        print(f());
+    }
+
+    // Everything the loop borrowed must still be intact.
+    print(b.s + "|" + b.xs[0] + "|" + b.xs[1] + "|" + b.m.get("k1") + "|" + b.d.tag);
+
+    // A borrowed local, and the real conversions, which do allocate.
+    let local = "wor" + "ld";
+    print(str(local) + " " + local);
+    print(str(42) + " " + str(3.5) + " " + str(true));
+}

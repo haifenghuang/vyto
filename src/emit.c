@@ -669,6 +669,12 @@ static char *emit_call(Em *em, Expr *e, bool *fresh) {
                                 c_escape(e->loc.file, strlen(e->loc.file)), e->loc.line,
                                 ex_b(em, a[0]));
         case B_STR:
+            /* str() on something already a string is a no-op conversion that
+               hands back the *same* pointer. Claiming it fresh makes the caller
+               release a reference it never took — a borrowed field read then
+               dies while its owner still points at it. Propagate the inner
+               freshness instead, exactly as the implicit EX_STRCONV does. */
+            if (a[0]->type->kind == TY_STRING) return ex(em, a[0], fresh);
             *fresh = true;
             return strconv_frag(em, a[0]);
         case B_PUSH: {
