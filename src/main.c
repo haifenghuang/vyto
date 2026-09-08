@@ -504,13 +504,31 @@ static const char *c_str_escape(const char *s) {
     return out;
 }
 
+/* Deepest asset tree we will walk. A real assets/ directory is a handful of
+   levels; anything past this is a loop we failed to detect or a tree nobody
+   meant to embed. */
+#define ASSET_MAX_DEPTH 32
+
 /* Recursively walk `abs` (an absolute dir), emitting for every regular file an
    .incbin asm blob + extern decls into `decls`, and a vt_vfs_register() call
    into `regs` keyed by the file's path relative to the app root (`logical`).
    Uses .incbin so embedding a multi-MB asset costs no giant C array. Hidden
-   entries (leading '.') are skipped. *n is the running asset counter. */
+   entries (leading '.') are skipped. *n is the running asset counter.
+
+   SYMLINKS ARE NOT FOLLOWED. Directory detection used to be "opendir()
+   succeeded", which is also true of a symlink TO a directory -- so a tree
+   containing one that points at an ancestor recursed until the build died.
+   pnpm and yarn workspaces build node_modules out of symlinks, so this is a
+   normal directory to drop beside an app, not an exotic one. lstat gives us
+   the link itself rather than its target; the depth cap is the backstop for
+   any loop lstat cannot see (a bind mount, a hardlinked directory). */
 static void emit_asset_dir(const char *abs, const char *logical,
-                           SBuf *decls, SBuf *regs, int *n) {
+                           SBuf *decls, SBuf *regs, int *n, int depth) {
+    if (depth > ASSET_MAX_DEPTH) {
+        fprintf(stderr, "vytoc: asset tree deeper than %d levels at %s "
+                        "-- not descending further\n", ASSET_MAX_DEPTH, abs);
+        return;
+    }
     DIR *dp = opendir(abs);
     if (!dp) return;
     struct dirent *de;
@@ -519,12 +537,14 @@ static void emit_asset_dir(const char *abs, const char *logical,
         const char *full = arena_printf(&g_arena, "%s/%s", abs, de->d_name);
         const char *log  = logical[0] ? arena_printf(&g_arena, "%s/%s", logical, de->d_name)
                                       : de->d_name;
-        DIR *sub = opendir(full);
-        if (sub) { /* it's a directory */
-            closedir(sub);
-            emit_asset_dir(full, log, decls, regs, n);
+        struct stat lst;
+        if (lstat(full, &lst) != 0) continue;
+        if (S_ISLNK(lst.st_mode)) continue;       /* never follow, see above */
+        if (S_ISDIR(lst.st_mode)) {
+            emit_asset_dir(full, log, decls, regs, n, depth + 1);
             continue;
         }
+        if (!S_ISREG(lst.st_mode)) continue;      /* fifo, device, socket */
         int id = (*n)++;
         sb_printf(decls,
             "__asm__(\n"
@@ -562,7 +582,7 @@ static const char *gen_asset_source(const char *app_dir) {
     int n = 0;
     for (size_t i = 0; i < sizeof data_dirs / sizeof *data_dirs; i++) {
         const char *d = arena_printf(&g_arena, "%s/%s", app_dir, data_dirs[i]);
-        emit_asset_dir(d, data_dirs[i], &decls, &regs, &n);
+        emit_asset_dir(d, data_dirs[i], &decls, &regs, &n, 0);
     }
     if (n == 0) { sb_free(&decls); sb_free(&regs); return NULL; }
     SBuf out;

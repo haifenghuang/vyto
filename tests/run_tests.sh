@@ -33,6 +33,40 @@ else
     fail=1
 fi
 
+# --- --with-assets: a symlink in the tree must not hang the build ---
+#
+# emit_asset_dir used to detect a directory by "opendir() succeeded", which is
+# also true of a symlink TO a directory -- so a link pointing at an ancestor
+# recursed until the build died. pnpm and yarn workspaces build node_modules
+# out of symlinks, so this is a normal thing to find beside an app.
+#
+# Fault-injected: reverting the lstat guard makes this case hang, which is why
+# it is wrapped in a timeout rather than merely checked for exit status.
+asset_dir=tests/tmp/assetloop
+rm -rf "$asset_dir"
+mkdir -p "$asset_dir/assets/deep"
+printf 'real\n'   > "$asset_dir/assets/real.txt"
+printf 'nested\n' > "$asset_dir/assets/deep/nested.txt"
+ln -s ../../assets "$asset_dir/assets/deep/loop"     # points at an ancestor
+ln -s /etc         "$asset_dir/assets/etclink"       # and outside the tree
+cat > "$asset_dir/main.vt" <<'ASSETEOF'
+import { assetExists } from "vyto/asset";
+fn main() {
+    print("real=" + assetExists("assets/real.txt"));
+    print("nested=" + assetExists("assets/deep/nested.txt"));
+}
+ASSETEOF
+if timeout 120 ./vytoc build "$asset_dir/main.vt" -o "$asset_dir/app" \
+       --with-assets >/dev/null 2>&1 \
+   && [ "$("$asset_dir/app" 2>/dev/null)" = "real=true
+nested=true" ]; then
+    echo "PASS asset_symlink_loop"
+else
+    echo "FAIL asset_symlink_loop (build hung, or assets missing)"
+    fail=1
+fi
+rm -rf "$asset_dir"
+
 # --- cbwrap package binding (fn-pointer params must map to rawptr) ---
 ./vytobind examples/cbwrap/native/src/cbwrap.h --filter 'cb_*' > examples/cbwrap/cbwrap.vt || exit 1
 if diff -u tests/cbwrap.vt.expected examples/cbwrap/cbwrap.vt >/dev/null 2>&1; then
