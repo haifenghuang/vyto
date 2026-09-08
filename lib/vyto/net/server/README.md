@@ -82,16 +82,34 @@ it is deliberately not the allocation, because allocating it up front cost
 
 ## Status
 
-**Not production-ready.** `Transfer-Encoding` is refused with 501 rather than
-mis-framed, and there are verified protocol gaps — `HEAD` sends a body,
-duplicate `Content-Length` is accepted, `Host` is not required, and
-`Expect: 100-continue` is ignored. There is no TLS, no graceful shutdown, no
-access log, and no metrics.
+**The protocol gaps this section used to list are fixed.** `HEAD` sends no body,
+duplicate and conflicting `Content-Length` is refused, `Host` is required on
+1.1, `Expect: 100-continue` gets its interim response, absolute-form targets
+match, header names are tchar-validated, and percent-decoding plus dot-segment
+normalisation happen before routing. `Transfer-Encoding` is still refused with
+501 rather than mis-framed — deliberately, since guessing at framing is the
+request-smuggling class of bug.
 
-Put a reverse proxy in front, or read the roadmap first. Design notes,
-measurements and that roadmap: `local/docs/HTTP.md`.
+What is genuinely still missing, and each is core:
 
-Tested by `examples/91_server.vt` — routing, parsing, limits, buffer growth,
-and the two framing rules. The concurrency cases (many simultaneous
+- **Signal handling.** `stop()` drains — closes the listener, finishes what is
+  in flight within `withDrainMs()` — but nothing triggers it from outside the
+  process, so `SIGTERM` still kills workers where they stand. The self-pipe
+  shim it needs exists (`vyto/os/reactor`'s `onSignal`); it is not wired in.
+  This is the biggest gap.
+- **Chunked request bodies** (501, above).
+- **TLS.** Terminate upstream.
+- **Cross-worker aggregation.** Pre-fork workers share nothing, so `ServerStats`
+  is per worker and any cache is too.
+
+Access logging and metrics are **seams, not gaps**: `onRequest(req, status,
+bytes, us)` and `ServerStats` ship, and the format, sink and `/metrics`
+endpoint are user-space by design — see "what belongs in this server" in
+`local/docs/HTTP.md`, which also carries the measurements and roadmap.
+
+Tested by `examples/91_server.vt` — 32 assertions over routing, parsing, limits,
+buffer growth, and the framing rules, with the security-critical subset promoted
+from `local/bench/http/srv_proto.vt`. The concurrency cases (many simultaneous
 connections, a stalled client not blocking a healthy one, worker resurrection)
-are not deterministic enough for the golden suite and live outside it.
+are not deterministic enough for the golden suite and live beside it in
+`local/bench/http/`.
