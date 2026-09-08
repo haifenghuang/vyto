@@ -2383,7 +2383,16 @@ export class Server {
 
         // Bind once in the parent purely to fail loudly on a busy port before
         // forking anything. Workers open their own.
-        let probe = socket_listen_reuseport(this.host, this.port, this.backlog);
+        //
+        // The probe is a PLAIN bind, not a SO_REUSEPORT one, and that is the
+        // whole point of it. REUSEPORT exists so this server's own workers can
+        // share a port -- but the kernel cannot tell our workers from an
+        // unrelated process, so a REUSEPORT probe SUCCEEDS on a port another
+        // server already holds. Two servers then sit on one port with the
+        // kernel splitting connections between them at random, neither having
+        // reported anything wrong. A plain bind is refused, which is the
+        // "fail loudly" this probe was always supposed to provide.
+        let probe = socket_listen_on(this.host, this.port, this.backlog);
         if (probe == null) { return false; }
         this.port = probe.localPort();
         probe.close();
@@ -2531,11 +2540,11 @@ export fn server(port: int): Server { return new Server(port); }
 //
 //   * chunked bodies     — currently 501. Mis-framing is request smuggling, so
 //                          refusing beats guessing
-//   * signals            — no SIGTERM/SIGINT handling, so the drain below has
-//                          no trigger from outside the process. Needs the
-//                          self-pipe pattern, which needs a C shim
-//   * sendfile           — static files without the bytes entering the process
-//   * body streaming     — the whole body is buffered before the handler runs
+//   * signals            — no SIGTERM/SIGINT handling, so stop()'s drain has no
+//                          trigger from outside the process. The self-pipe shim
+//                          this needs now EXISTS — vyto/os/reactor's
+//                          onSignal() — it is simply not wired into the reactor
+//                          loop below. HTTP.md P1, and the biggest gap left
 //   * TLS                — terminate upstream for v1. If it ever runs in
 //                          process it is core: it wraps the fd in the reactor
 //   * shared state       — pre-fork workers share nothing, so any cache and any
