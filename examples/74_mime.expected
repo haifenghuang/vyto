@@ -24,6 +24,7 @@ built   = application/json; charset=utf-8
 .png    = image/png
 path    = text/html; charset=utf-8
 double  = application/gzip
+sourcemap = application/json
 dotfile = application/octet-stream
 unknown = application/octet-stream
 

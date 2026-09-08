@@ -67,6 +67,7 @@ fn main() {
     print(".png    = " + mime_from_ext("PNG"));
     print("path    = " + mime_from_path("/srv/www/index.html"));
     print("double  = " + mime_from_path("archive.tar.gz"));
+    print("sourcemap = " + mime_from_path("/assets/app.js.map"));
     print("dotfile = " + mime_from_path("/home/ada/.bashrc"));
     print("unknown = " + mime_from_ext("qqq"));
 

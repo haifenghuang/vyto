@@ -399,6 +399,10 @@ export fn mime_from_ext(ext: string): string {
     if (e == "md" || e == "markdown") { return "text/markdown; charset=utf-8"; }
     if (e == "js" || e == "mjs") { return "text/javascript; charset=utf-8"; }
     if (e == "json") { return "application/json"; }
+    // A source map is JSON. Browsers only fetch it when devtools is open and
+    // do not care about the type, but serving it as octet-stream makes it a
+    // download rather than a document to anything else looking at it.
+    if (e == "map") { return "application/json"; }
     if (e == "jsonl" || e == "ndjson") { return "application/x-ndjson"; }
     if (e == "xml") { return "application/xml"; }
     if (e == "xhtml") { return "application/xhtml+xml"; }
