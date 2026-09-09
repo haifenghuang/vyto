@@ -29,6 +29,8 @@ import { CHAR_SLASH } from "vyto/util/ascii";
 extern "C" {
     fn vt_vfs_size(key: cstring): i64;
     fn vt_vfs_read(key: cstring, buf: cstring, cap: i64): i64;
+    fn vt_vfs_size_exact(key: cstring): i64;
+    fn vt_vfs_read_exact(key: cstring, buf: cstring, cap: i64): i64;
     fn vt_vfs_count(): i32;
     fn vt_vfs_key(i: i32): cstring;
 }
@@ -52,6 +54,29 @@ export fn assetBytes(logical: string): byte[] {
 export fn assetExists(logical: string): bool {
     if (vt_vfs_size(logical.cstr()) >= 0 as i64) { return true; }
     return file_exists(`{appDir()}/{logical}`);
+}
+
+// The embedded-only lookups, matching the key EXACTLY.
+//
+// vt_vfs_get also matches when the registered key is a path-component tail of
+// the query, so "assets/404.html" answers a lookup for "/anything/assets/404.html".
+// That is convenient for code holding a longer path and wrong for anything
+// holding user input: a server passing a request path to assetBytes would serve
+// an embedded blob for a URL that merely ends with its name.
+//
+// These two are for that caller. They also do NOT fall through to disk, which is
+// the second half of the same problem -- a file dropped in the working directory
+// must not be able to stand in for a page compiled into the binary.
+export fn assetBytesExact(logical: string): byte[] {
+    let n = vt_vfs_size_exact(logical.cstr());
+    if (n < 0 as i64) { return bytes(0); }
+    let buf = bytes(n as int);
+    if (n > 0 as i64) { vt_vfs_read_exact(logical.cstr(), buf as cstring, n); }
+    return buf;
+}
+
+export fn assetExistsExact(logical: string): bool {
+    return vt_vfs_size_exact(logical.cstr()) >= 0 as i64;
 }
 
 // Replace '/' with '_' so a logical path becomes a flat temp filename.

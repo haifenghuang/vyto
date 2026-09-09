@@ -27,14 +27,17 @@ void vt_vfs_register(const char *logical, const unsigned char *data, long len) {
     g_vfs_n++;
 }
 
-int vt_vfs_get(const char *key, const unsigned char **out, long *out_len) {
+/* The shared scan. `exact` drops the path-component-suffix arm, leaving only
+   whole-string equality — see vt_vfs_get_exact for why a caller wants that. */
+static int vfs_lookup(const char *key, const unsigned char **out, long *out_len,
+                      int exact) {
     if (!key) return 0;
     size_t kn = strlen(key);
     for (int i = 0; i < g_vfs_n; i++) {
         const char *e = g_vfs[i].logical;
         size_t en = strlen(e);
         int hit = (kn == en && memcmp(key, e, en) == 0) ||
-                  (kn > en && key[kn - en - 1] == '/' &&
+                  (!exact && kn > en && key[kn - en - 1] == '/' &&
                    memcmp(key + kn - en, e, en) == 0);
         if (hit) {
             if (out) *out = g_vfs[i].data;
@@ -43,6 +46,19 @@ int vt_vfs_get(const char *key, const unsigned char **out, long *out_len) {
         }
     }
     return 0;
+}
+
+int vt_vfs_get(const char *key, const unsigned char **out, long *out_len) {
+    return vfs_lookup(key, out, out_len, 0);
+}
+
+int vt_vfs_get_exact(const char *key, const unsigned char **out, long *out_len) {
+    return vfs_lookup(key, out, out_len, 1);
+}
+
+long vt_vfs_size_exact(const char *key) {
+    long n = -1;
+    return vfs_lookup(key, NULL, &n, 1) ? n : -1;
 }
 
 int vt_vfs_has(const char *key) { return vt_vfs_get(key, NULL, NULL); }
@@ -60,6 +76,14 @@ long vt_vfs_size(const char *key) {
 long vt_vfs_read(const char *key, unsigned char *buf, long cap) {
     const unsigned char *p; long n;
     if (!vt_vfs_get(key, &p, &n)) return -1;
+    if (n > cap) n = cap;
+    if (n > 0) memcpy(buf, p, (size_t)n);
+    return n;
+}
+
+long vt_vfs_read_exact(const char *key, unsigned char *buf, long cap) {
+    const unsigned char *p; long n;
+    if (!vt_vfs_get_exact(key, &p, &n)) return -1;
     if (n > cap) n = cap;
     if (n > 0) memcpy(buf, p, (size_t)n);
     return n;
