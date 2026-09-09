@@ -67,6 +67,113 @@ else
 fi
 rm -rf "$asset_dir"
 
+# --- vt_vfs_get_exact: a suffix must NOT reach an embedded asset ---
+#
+# vt_vfs_get matches when the registered key is a path-component tail of the
+# query, so a stored "assets/404.html" also answers "/anything/assets/404.html".
+# That is fine for code holding a longer path and wrong for a server passing a
+# REQUEST path to the registry: a URL that merely ends with an embedded name
+# would serve the embedded blob.
+#
+# assetBytesExact/assetExistsExact are the whole-string forms. This pins both
+# halves -- the suffix arm still works through assetExists, and does not through
+# assetExistsExact -- because a test that only checked the new function would
+# pass if the exact lookup were wired to the old one.
+exact_dir=tests/tmp/vfsexact
+rm -rf "$exact_dir"
+mkdir -p "$exact_dir/assets"
+printf 'FLOOR\n' > "$exact_dir/assets/404.html"
+cat > "$exact_dir/main.vt" <<'EXACTEOF'
+import { assetExists, assetExistsExact, assetBytes, assetBytesExact } from "vyto/asset";
+fn main() {
+    // The key as registered: both forms find it.
+    print("exact_hit=" + assetExistsExact("assets/404.html"));
+    print("suffix_hit=" + assetExists("assets/404.html"));
+
+    // A request-shaped path ending in the key. The suffix arm matches it; the
+    // exact one must not.
+    print("suffix_reaches=" + assetExists("/evil/assets/404.html"));
+    print("exact_reaches=" + assetExistsExact("/evil/assets/404.html"));
+
+    // And the bytes follow the same rule -- a miss is empty, not the floor.
+    print("exact_bytes=" + str(assetBytesExact("assets/404.html").len));
+    print("suffix_bytes=" + str(assetBytesExact("/evil/assets/404.html").len));
+}
+EXACTEOF
+if timeout 120 ./vytoc build "$exact_dir/main.vt" -o "$exact_dir/app" \
+       --with-assets >/dev/null 2>&1 \
+   && [ "$("$exact_dir/app" 2>/dev/null)" = "exact_hit=true
+suffix_hit=true
+suffix_reaches=true
+exact_reaches=false
+exact_bytes=6
+suffix_bytes=0" ]; then
+    echo "PASS vfs_get_exact"
+else
+    echo "FAIL vfs_get_exact (suffix match not confined, or exact lookup broken)"
+    "$exact_dir/app" 2>&1 | head -10
+    fail=1
+fi
+rm -rf "$exact_dir"
+
+# --- res.sendBytes: an embedded body served without copying it to a string ---
+#
+# body_str would mean str_alloc + memcpy of the asset on every request
+# (runtime/vyto_rt.c:854) for bytes that never change. sendBytes frames from the
+# pointer length and appends straight from .rodata.
+#
+# HEAD is the case worth pinning: it must advertise the length a GET would have
+# produced and send no body. A body source that ignores body_allowed desyncs the
+# connection, which is the failure this whole framing is careful about.
+sb_dir=tests/tmp/sendbytes
+rm -rf "$sb_dir"
+mkdir -p "$sb_dir/assets"
+printf 'FLOOR\n' > "$sb_dir/assets/404.html"
+cat > "$sb_dir/main.vt" <<'SBEOF'
+import { server } from "vyto/net/server";
+import { socket_connect } from "vyto/net/socket";
+
+extern "C" {
+    fn vt_vfs_ptr(key: cstring): rawptr;
+    fn vt_vfs_size(key: cstring): i64;
+}
+
+fn main() {
+    let s = server(0);
+    s.withHandler((req, res) => {
+        let p = vt_vfs_ptr("assets/404.html".cstr());
+        let n = vt_vfs_size("assets/404.html".cstr()) as int;
+        if (p == null) { res.text(500, "no asset"); return; }
+        res.sendBytes(200, p, n);
+    });
+    let port = s.bind();
+    if (port <= 0) { print("bind failed"); return; }
+    for (let v in ["GET", "HEAD"]) {
+        let c = socket_connect("127.0.0.1", port);
+        c.setTimeoutMs(3000);
+        c.sendText(v + " /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        s.serveOnce();
+        let r = c.recvText(65536);
+        c.close();
+        print(v + " len=" + str(r.contains("Content-Length: 6")));
+        print(v + " body=" + str(r.contains("FLOOR")));
+    }
+}
+SBEOF
+if timeout 120 ./vytoc build "$sb_dir/main.vt" -o "$sb_dir/app" \
+       --with-assets >/dev/null 2>&1 \
+   && [ "$("$sb_dir/app" 2>/dev/null)" = "GET len=true
+GET body=true
+HEAD len=true
+HEAD body=false" ]; then
+    echo "PASS res_send_bytes"
+else
+    echo "FAIL res_send_bytes (framing wrong, or HEAD sent a body)"
+    "$sb_dir/app" 2>&1 | head -10
+    fail=1
+fi
+rm -rf "$sb_dir"
+
 # --- cbwrap package binding (fn-pointer params must map to rawptr) ---
 ./vytobind examples/cbwrap/native/src/cbwrap.h --filter 'cb_*' > examples/cbwrap/cbwrap.vt || exit 1
 if diff -u tests/cbwrap.vt.expected examples/cbwrap/cbwrap.vt >/dev/null 2>&1; then

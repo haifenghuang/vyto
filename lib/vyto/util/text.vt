@@ -55,6 +55,19 @@ export class StringBuilder {
         sb_append_slice(this.h, s.cstr(), a as i64, b as i64);
         return this;
     }
+    // Append `len` bytes at `ptr` — memory this builder does not own and only
+    // reads. For bytes that are already resident and are not a Vyto string: an
+    // asset embedded in .rodata, a C-owned buffer. Making a string first would
+    // allocate and copy purely to hand the same bytes back.
+    //
+    // A null pointer or a non-positive length appends nothing, matching
+    // appendSlice's clamp-don't-panic rule.
+    fn appendPtr(ptr: rawptr, len: int): StringBuilder {
+        if (ptr == null || len <= 0) { return this; }
+        sb_append(this.h, ptr as cstring, len as i64);
+        return this;
+    }
+
     fn appendInt(v: int): StringBuilder { sb_append_i64(this.h, v as i64); return this; }
     fn appendFloat(v: float): StringBuilder { sb_append_f64(this.h, v); return this; }
     fn appendByte(b: int): StringBuilder { sb_append_byte(this.h, b as i32); return this; }

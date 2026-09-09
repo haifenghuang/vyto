@@ -923,6 +923,21 @@ export class ServerResponse {
     file_fd: int;
     file_len: int;
 
+    // A body that is already in this process's memory and outlives the
+    // response: an embedded asset in .rodata, a static table. null when unused.
+    //
+    // Distinct from body_str because a Vyto string cannot name that memory
+    // without copying it — vt_file_read str_alloc+memcpy's an embedded asset on
+    // every call (runtime/vyto_rt.c:854), which for a page served on an error
+    // path is a copy per request of bytes that never change. Distinct from
+    // file_fd because there is no fd and nothing to sendfile from.
+    //
+    // The pointer is NOT owned: the caller guarantees it outlives the response.
+    // That is safe for .rodata and wrong for a heap buffer freed by the handler,
+    // which is why sendBytes says so in its docstring.
+    body_ptr: rawptr;
+    body_ptr_len: int;
+
     fn init() {
         this.status = 200;
         this.hdrs = new StringBuilder(256);
@@ -935,6 +950,8 @@ export class ServerResponse {
         this.set_names = [];
         this.file_fd = -1;
         this.file_len = 0;
+        this.body_ptr = null;
+        this.body_ptr_len = 0;
     }
 
     // Send `path` as the body. Returns false if it cannot be opened, leaving
@@ -954,6 +971,24 @@ export class ServerResponse {
         this.file_fd = fd;
         this.file_len = n;
         return true;
+    }
+
+    // Send `len` bytes at `ptr` as the body, without copying them into a string.
+    //
+    // For memory that is already resident and outlives the response — an asset
+    // embedded in .rodata by --with-assets, a static table. The alternative is
+    // body_str, which for an embedded asset means str_alloc + memcpy on every
+    // request (runtime/vyto_rt.c:854) of bytes that are never going to change.
+    //
+    // THE POINTER IS BORROWED, NOT OWNED. It must stay valid until the response
+    // has been written, and the response is not necessarily written before the
+    // handler returns: the reactor can finish a partial write on a later poll.
+    // A pointer into .rodata is always safe. A heap buffer the handler frees is
+    // a use-after-free, and core cannot detect it.
+    fn sendBytes(status: int, ptr: rawptr, len: int) {
+        this.status = status;
+        this.body_ptr = ptr;
+        this.body_ptr_len = len;
     }
 
     // Hand this connection off after the response is sent. The reactor stops
@@ -1656,9 +1691,10 @@ export class Server {
         // produced, and no body — the length is the whole point of a HEAD, so
         // it must be the real one and not zero.
         let no_len = res.status == 204 || res.status == 304;
-        // A file body is framed by its own length, not by body_str.
+        // A file or pointer body is framed by its own length, not by body_str.
         let blen = res.body_str.len;
         if (res.file_fd >= 0) { blen = res.file_len; }
+        else if (res.body_ptr != null) { blen = res.body_ptr_len; }
         if (!no_len) {
             out.append("Content-Length: ").appendInt(blen).append("\r\n");
         }
@@ -1670,13 +1706,22 @@ export class Server {
         // A file body is not appended — it goes to the socket directly, after
         // these headers have left.
         if (res.body_allowed && !no_len && res.file_fd < 0) {
-            out.append(res.body_str);
+            // A pointer body appends straight from its own memory: sb_append
+            // already takes (ptr, len), so this is the memcpy into the output
+            // buffer that body_str would have done anyway, minus the string
+            // allocation in front of it.
+            if (res.body_ptr != null) { out.appendPtr(res.body_ptr, res.body_ptr_len); }
+            else { out.append(res.body_str); }
         }
     }
 
     // Blocking path (serveOnce / serve_conn); the reactor writes into the Conn.
     fn send_response(c: Socket, res: ServerResponse, keep: bool) {
-        let out = new StringBuilder(res.body_str.len + 256);
+        // Size the buffer for whichever body source is in play, so a pointer
+        // body does not force a grow on every response.
+        let hint = res.body_str.len;
+        if (res.body_ptr != null) { hint = res.body_ptr_len; }
+        let out = new StringBuilder(hint + 256);
         this.write_response(out, res, keep);
         c.sendText(out.toString());
         // The blocking path has no POLL_WRITE to resume on, so the file goes
