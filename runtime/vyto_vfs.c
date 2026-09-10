@@ -68,6 +68,14 @@ const unsigned char *vt_vfs_ptr(const char *key) {
     return vt_vfs_get(key, &p, NULL) ? p : NULL;
 }
 
+/* The exact-match twin of vt_vfs_ptr. A caller that wants BOTH a borrowed
+   .rodata pointer (no copy per response) and a whole-string match needs this
+   one: the pair above trades one for the other. */
+const unsigned char *vt_vfs_ptr_exact(const char *key) {
+    const unsigned char *p = NULL;
+    return vt_vfs_get_exact(key, &p, NULL) ? p : NULL;
+}
+
 long vt_vfs_size(const char *key) {
     long n = -1;
     return vt_vfs_get(key, NULL, &n) ? n : -1;

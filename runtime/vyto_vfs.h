@@ -39,9 +39,12 @@ long vt_vfs_size(const char *key);
    on miss. Lets .vt build a byte[] without exposing the raw pointer. */
 long vt_vfs_read(const char *key, unsigned char *buf, long cap);
 
-/* Exact-match forms of the two accessors .vt code reaches (vyto/asset). */
+/* Exact-match forms of the accessors .vt code reaches (vyto/asset). ptr_exact
+   is for a caller that needs a borrowed pointer AND a whole-string match --
+   serving an embedded page as a response body without copying it per request. */
 long vt_vfs_size_exact(const char *key);
 long vt_vfs_read_exact(const char *key, unsigned char *buf, long cap);
+const unsigned char *vt_vfs_ptr_exact(const char *key);
 
 /* Registry iteration (for asset listing). vt_vfs_key returns NULL out of range.
    Keys are the logical paths as registered, e.g. "assets/logo.png". */

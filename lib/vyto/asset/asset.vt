@@ -31,6 +31,7 @@ extern "C" {
     fn vt_vfs_read(key: cstring, buf: cstring, cap: i64): i64;
     fn vt_vfs_size_exact(key: cstring): i64;
     fn vt_vfs_read_exact(key: cstring, buf: cstring, cap: i64): i64;
+    fn vt_vfs_ptr_exact(key: cstring): rawptr;
     fn vt_vfs_count(): i32;
     fn vt_vfs_key(i: i32): cstring;
 }
@@ -77,6 +78,24 @@ export fn assetBytesExact(logical: string): byte[] {
 
 export fn assetExistsExact(logical: string): bool {
     return vt_vfs_size_exact(logical.cstr()) >= 0 as i64;
+}
+
+// The embedded blob itself, borrowed rather than copied: a pointer into the
+// generated asset TU's .rodata, valid for the life of the process, plus its
+// length via assetSizeExact. null when the key is not embedded.
+//
+// This is the one accessor that does NOT fall back to disk and does not copy,
+// which is exactly what a response body wants -- ServerResponse.sendBytes takes
+// a borrowed pointer, so an embedded page can be served without a str_alloc +
+// memcpy per request. The pointer is only safe BECAUSE it is .rodata; nothing
+// here hands out a heap buffer.
+export fn assetPtrExact(logical: string): rawptr {
+    return vt_vfs_ptr_exact(logical.cstr());
+}
+
+// Byte length of an embedded asset, or -1 on miss. Pairs with assetPtrExact.
+export fn assetSizeExact(logical: string): int {
+    return vt_vfs_size_exact(logical.cstr()) as int;
 }
 
 // Replace '/' with '_' so a logical path becomes a flat temp filename.
