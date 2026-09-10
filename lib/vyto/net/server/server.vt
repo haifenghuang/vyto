@@ -136,6 +136,21 @@ export class Limits {
     // nginx moved its equivalent from 100 to 1000 for the same reason.
     max_keepalive_reqs: int;
 
+    // How long a RESPONSE STREAM may sit without the source producing anything.
+    //
+    // A separate budget because recv_timeout_ms is the wrong instrument: it
+    // measures inbound silence, and an event stream is silent inbound BY
+    // DESIGN — the client sends one request and then only listens. Left to the
+    // recv deadline, every stream would be swept at 15 seconds, which looks
+    // like it works right up until a stream needs to outlive it.
+    //
+    // Not "unlimited", for the reason max_streamed_bytes gives: a source that
+    // says SRC_IDLE forever is indistinguishable from a wedged one, and a
+    // connection nothing can reclaim is a slot leak an attacker can open at
+    // will. A stream that genuinely has nothing to say should emit a heartbeat
+    // -- which is what SSE comments exist for.
+    stream_idle_ms: int;
+
     fn init() {
         this.max_request_line   = 8 * 1024;
         this.max_header_count   = 100;
@@ -145,6 +160,7 @@ export class Limits {
         this.stream_chunk_bytes = 64 * 1024;
         this.recv_timeout_ms    = 15 * 1000;
         this.max_keepalive_reqs = 2048;
+        this.stream_idle_ms     = 5 * 60 * 1000;
     }
 }
 
@@ -181,6 +197,7 @@ export const ABORT_TIMEOUT: int = 2;           // idle sweep took the connection
 export const ABORT_TOO_LARGE: int = 3;         // more body arrived than declared
 export const ABORT_REJECTED: int = 4;          // this sink returned false
 export const ABORT_SHUTDOWN: int = 5;          // drain budget expired
+export const ABORT_WRITE_FAILED: int = 6;      // the socket died mid-stream
 
 export fn abort_reason_name(r: int): string {
     if (r == ABORT_CONNECTION_LOST) { return "connection-lost"; }
@@ -188,7 +205,55 @@ export fn abort_reason_name(r: int): string {
     if (r == ABORT_TOO_LARGE)       { return "too-large"; }
     if (r == ABORT_REJECTED)        { return "rejected"; }
     if (r == ABORT_SHUTDOWN)        { return "shutdown"; }
+    if (r == ABORT_WRITE_FAILED)    { return "write-failed"; }
     return "unknown";
+}
+
+// ---------------------------------------------------------- response streams
+//
+// The OUTBOUND counterpart of BodySink: a response body produced a piece at a
+// time instead of being known up front. Framed with Transfer-Encoding: chunked,
+// so the connection stays reusable afterwards.
+//
+// PULL, NOT PUSH, and that is the whole design. A push API — hand the handler a
+// writer it calls write() on — would let it block the reactor, and there is no
+// thread to push from: a worker runs one loop and every connection on it shares
+// that loop. Core therefore asks the source for bytes when the socket can take
+// them, and SRC_IDLE is how a source says "nothing yet" without spinning.
+//
+// What that buys, and what it does not. Enough for a heartbeat, a progress
+// stream, tailing a file, or compressing a body that is already in hand. NOT
+// enough for an event arriving from another process at an arbitrary instant:
+// nothing wakes the loop for it, so it is delivered on the next writable event
+// or the next sweep tick. vyto/os/reactor already has the primitive that would
+// fix this (wakeable()/wake(), a self-pipe) but wiring it into this loop is a
+// separate piece of work — see HTTP.md.
+export const SRC_MORE: int = 0;   // wrote something; ask again this wakeup
+export const SRC_IDLE: int = 1;   // nothing available; stop asking until later
+export const SRC_END: int = 2;    // body complete; core writes the terminator
+
+export class BodySource {
+    // Append the next piece of the body into `out`, and say what happens next.
+    //
+    // The builder is CORE'S. Write into it and return; do not keep it. That is
+    // what makes retention impossible here — the inbound side had to hand a
+    // sink freshly-allocated chunks to get the same property, and this
+    // direction gets it for free by never handing anything back.
+    //
+    // A single pull may append at most Limits.stream_chunk_bytes; more than
+    // that is truncated to it, because an unbounded pull would defeat the
+    // bounded output buffer this rides on.
+    virtual fn pull(out: StringBuilder): int { return SRC_END; }
+
+    // The stream will NOT complete. Exactly once, on every death path,
+    // including ones the reactor does not know it is on — the refcounted
+    // Conn.deinit is the backstop, exactly as it is for BodySink.
+    //
+    // FOR AN EVENT STREAM THIS IS THE NORMAL ENDING, not an error: a browser
+    // closes the connection when the page navigates away, and the server learns
+    // by a write failing. A source that treats on_abort as exceptional will log
+    // an error every time a user leaves.
+    virtual fn on_abort(reason: int) { }
 }
 
 export class BodySink {
@@ -551,6 +616,40 @@ const SWEEP_INTERVAL_MS: int = 500;
 // Bytes requested per read. A short read means the socket is drained.
 const RECV_CHUNK: int = 4096;
 
+// How many times one flush() will ask a source for bytes before returning to
+// the loop. A source that always has more must not starve the other
+// connections this worker is holding — the reactor is cooperative, so a
+// runaway pull is a stall for everybody else.
+const SRC_PULLS_PER_FLUSH: int = 16;
+
+// Ceiling on ONE chunk. Mirrors the inbound stream_chunk_bytes: an unbounded
+// pull would defeat the bounded output buffer this rides on.
+const SRC_MAX_CHUNK: int = 64 * 1024;
+
+// Backstop for the blocking path, which drives a source to completion with no
+// loop to hand back to. A source that never says SRC_END would hang serveOnce()
+// forever, and a test that hangs is worse than one that fails.
+const SRC_BLOCKING_MAX_PULLS: int = 100000;
+
+// Lowercase hex, no padding — the chunk-size line of RFC 7230 3.3.1.
+fn hex_of(v: int): string {
+    if (v == 0) { return "0"; }
+    let digits = "0123456789abcdef";
+    let buf = bytes(16);
+    let n = 0;
+    let x = v;
+    while (x > 0) {
+        buf[n] = digits[x & 15] as byte;
+        n += 1;
+        x = x >> 4;
+    }
+    // Built backwards; reverse in place rather than allocating a second buffer.
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) { out[i] = buf[n - 1 - i]; i += 1; }
+    return str(out as cstring);
+}
+
 // pump_stream outcomes.
 const PUMP_MORE: int = 0;   // body done, response written, resume parsing
 const PUMP_WAIT: int = 1;   // would block, or output is backed up
@@ -597,6 +696,22 @@ class Conn {
     file_fd: int;
     file_left: int;
 
+    // A streamed response body, pulled a chunk at a time. Non-null means "mid
+    // stream": the connection is not finished with this response even though
+    // its head has long since left, and it must stay armed for POLL_WRITE.
+    body_src: BodySource;
+    src_aborted: bool;         // abort_source is idempotent
+    src_done: bool;            // the terminating 0-chunk has been queued
+    // Scratch the source writes into, so a chunk can be measured before its
+    // length header is emitted. Allocated on first use and reused for the whole
+    // stream: one allocation, not one per chunk.
+    src_buf: StringBuilder;
+    // Separate from `deadline`, which measures INBOUND silence. A stream is
+    // silent inbound by design, so it is judged on whether the SOURCE is
+    // producing, not on whether the peer is talking.
+    src_deadline: int;
+    idle_budget: int;          // Limits.stream_idle_ms, copied at attach
+
     // Set when the handler called res.upgrade(). The reactor invokes it after
     // the response has fully left, then forgets the connection without closing
     // the socket.
@@ -640,6 +755,12 @@ class Conn {
         this.upgrade_cb = null;
         this.file_fd = -1;
         this.file_left = 0;
+        this.body_src = null;
+        this.src_aborted = false;
+        this.src_done = false;
+        this.src_buf = null;
+        this.src_deadline = 0;
+        this.idle_budget = L.stream_idle_ms;
         this.stream_sink = null;
         this.stream_left = 0;
         this.stream_req = null;
@@ -660,6 +781,25 @@ class Conn {
             this.stream_sink.on_abort(reason);
         }
         this.clear_stream();
+    }
+
+    // The outbound twin of abort_stream, and idempotent for the same reason.
+    //
+    // For an event stream this fires on the ORDINARY ending -- the peer closed
+    // the page -- so it is not an error path, merely the only path.
+    fn abort_source(reason: int) {
+        if (this.body_src == null) { return; }
+        if (!this.src_aborted) {
+            this.src_aborted = true;
+            this.body_src.on_abort(reason);
+        }
+        this.clear_source();
+    }
+
+    fn clear_source() {
+        this.body_src = null;
+        this.src_aborted = false;
+        this.src_done = false;
     }
 
     fn clear_stream() {
@@ -684,20 +824,35 @@ class Conn {
             this.stream_aborted = true;
             this.stream_sink.on_abort(ABORT_CONNECTION_LOST);
         }
+        // The same backstop, outbound. A source holding a database cursor or a
+        // subscription must learn that nobody is reading any more, and the
+        // paths that reach here are exactly the ones that did not know why.
+        if (this.body_src != null && !this.src_aborted) {
+            this.src_aborted = true;
+            this.body_src.on_abort(ABORT_CONNECTION_LOST);
+        }
         if (this.file_fd >= 0) { close(this.file_fd as i32); this.file_fd = -1; }
     }
 
+    // A live source counts as pending even with an empty buffer: the response
+    // is not finished, and a connection that reported "nothing to do" here
+    // would have its POLL_WRITE disarmed and never be asked again.
     fn hasPending(): bool {
-        return this.out_off < this.out.len() || this.file_left > 0;
+        return this.out_off < this.out.len() || this.file_left > 0
+            || this.body_src != null;
     }
 
     // The builder responses are written into. Pipelined responses append to the
     // same buffer, so they leave in order for free.
     fn outBuf(): StringBuilder { return this.out; }
 
-    // Push as much pending output as the socket will take.
-    //  1 = everything flushed, 0 = partial (wait for writable), -1 = dead
-    fn flush(): int {
+    // Drain the output buffer to the socket.
+    //  1 = empty, 0 = partial (wait for writable), -1 = dead
+    //
+    // Factored out of flush() because a streamed chunk is appended to this same
+    // buffer and then has to leave the same way, so the loop runs more than
+    // once per flush.
+    fn drain_out(): int {
         while (this.out_off < this.out.len()) {
             let n = this.sock.trySendRaw(this.out.cstr(), this.out_off,
                                          this.out.len() - this.out_off);
@@ -709,6 +864,14 @@ class Conn {
         // connection, not once per response.
         this.out.clear();
         this.out_off = 0;
+        return 1;
+    }
+
+    // Push as much pending output as the socket will take.
+    //  1 = everything flushed, 0 = partial (wait for writable), -1 = dead
+    fn flush(): int {
+        let d = this.drain_out();
+        if (d <= 0) { return d; }
 
         // Headers are gone; now the file body, if there is one. sendfile keeps
         // its own file offset, so a partial send resumes simply by calling it
@@ -730,7 +893,78 @@ class Conn {
             this.file_fd = -1;
             this.file_left = 0;
         }
+
+        // Finally the streamed body, if this response has one. Everything above
+        // has left the socket, so a chunk appended now cannot jump the head.
+        if (this.body_src != null) { return this.pump_source(); }
         return 1;
+    }
+
+    // Pull chunks and write them until the source has nothing more to give
+    // right now, the socket refuses more, or the body ends.
+    //
+    //  1 = the stream finished and the connection is free
+    //  0 = still streaming; keep POLL_WRITE armed and come back
+    // -1 = dead
+    //
+    // `src_done` is separate from `body_src == null` because the terminator has
+    // to be FLUSHED before the stream is over, and that flush can block like
+    // any other write.
+    fn pump_source(): int {
+        let budget = SRC_PULLS_PER_FLUSH;
+        while (true) {
+            if (this.src_done) {
+                let d = this.drain_out();
+                if (d <= 0) { return d; }
+                // The terminator is on the wire. The connection is reusable.
+                this.clear_source();
+                return 1;
+            }
+
+            if (budget <= 0) { return 0; }
+            budget -= 1;
+
+            // The source writes into ITS OWN buffer, not into `out`. Chunked
+            // framing needs the length in front of the data, and a builder
+            // cannot be truncated, so the piece has to be sized before it is
+            // committed. The scratch buffer is per connection and reused, so
+            // this costs one allocation for the life of the stream rather than
+            // one per chunk.
+            if (this.src_buf == null) { this.src_buf = new StringBuilder(1024); }
+            this.src_buf.clear();
+            let verdict = this.body_src.pull(this.src_buf);
+
+            let n = this.src_buf.len();
+            // A zero-length pull emits NOTHING. "0\r\n" is the terminator, so
+            // an empty data chunk would end the body early and every chunk
+            // after it would be read as the head of the next response.
+            if (n > 0) {
+                // Real progress: the stream is alive, so push its deadline out.
+                // Only bytes count -- an SRC_IDLE that produced nothing must not
+                // keep a wedged stream alive forever.
+                this.src_deadline = mono_ms() + this.idle_budget;
+                if (n > SRC_MAX_CHUNK) { n = SRC_MAX_CHUNK; }
+                this.out.append(hex_of(n)).append("\r\n");
+                this.out.appendPtr(this.src_buf.cstr() as rawptr, n);
+                this.out.append("\r\n");
+            }
+
+            if (verdict == SRC_END) {
+                this.out.append("0\r\n\r\n");
+                this.src_done = true;
+                continue;
+            }
+
+            let d = this.drain_out();
+            if (d < 0) { return -1; }
+
+            // IDLE means "nothing until something happens elsewhere". Returning
+            // 0 parks the connection on POLL_WRITE rather than spinning the
+            // loop at 100% CPU asking a source that already said no.
+            if (verdict == SRC_IDLE) { return 0; }
+            if (d == 0) { return 0; }           // socket full; resume later
+        }
+        return 0;
     }
 
     // Ensure raw holds at least `need` bytes. Doubles, clamped to cap.
@@ -938,6 +1172,12 @@ export class ServerResponse {
     body_ptr: rawptr;
     body_ptr_len: int;
 
+    // A body produced a piece at a time. Framed chunked rather than by
+    // Content-Length, since the length is not knowable when the head is sent.
+    // Mutually exclusive with the other three: sendStream is checked first
+    // everywhere a body source is selected.
+    body_src: BodySource;
+
     fn init() {
         this.status = 200;
         this.hdrs = new StringBuilder(256);
@@ -951,6 +1191,7 @@ export class ServerResponse {
         this.file_fd = -1;
         this.file_len = 0;
         this.body_ptr = null;
+        this.body_src = null;
         this.body_ptr_len = 0;
     }
 
@@ -989,6 +1230,25 @@ export class ServerResponse {
         this.status = status;
         this.body_ptr = ptr;
         this.body_ptr_len = len;
+    }
+
+    // Send a body the handler cannot size in advance: core pulls from `src`
+    // until it says SRC_END, framing each piece as a chunk.
+    //
+    // The response head leaves immediately, so a client sees the status and the
+    // headers before the first chunk exists. That is the point for an event
+    // stream, and it is why Content-Length cannot be used.
+    //
+    // THE CONNECTION IS OWNED FOR THE STREAM'S LIFETIME. A worker runs one loop
+    // over every connection it holds; a source that never returns SRC_END holds
+    // its slot until the peer leaves. That is the honest cost of streaming on a
+    // shared-nothing pre-fork server, and it is a capacity decision, not a
+    // detail: N concurrent streams need N connection slots that are serving
+    // nobody else.
+    fn sendStream(status: int, src: BodySource): ServerResponse {
+        this.status = status;
+        this.body_src = src;
+        return this;
     }
 
     // Hand this connection off after the response is sent. The reactor stops
@@ -1667,6 +1927,13 @@ export class Server {
     // Append a complete response into `out`. Nothing is materialised as a
     // string: the reactor passes the connection's reusable buffer and sends
     // directly from it.
+    // Does this response actually carry its stream? 204 and 304 say "no body"
+    // in the framing, so a source attached to one is refused rather than
+    // silently dropped -- the same rule write_response applies.
+    fn keep_body_for(res: ServerResponse): bool {
+        return res.status != 204 && res.status != 304;
+    }
+
     fn write_response(out: StringBuilder, res: ServerResponse, keep: bool) {
         out.append("HTTP/1.1 ").appendInt(res.status).append(" ")
            .append(status_text(res.status)).append("\r\n");
@@ -1691,12 +1958,23 @@ export class Server {
         // produced, and no body — the length is the whole point of a HEAD, so
         // it must be the real one and not zero.
         let no_len = res.status == 204 || res.status == 304;
-        // A file or pointer body is framed by its own length, not by body_str.
-        let blen = res.body_str.len;
-        if (res.file_fd >= 0) { blen = res.file_len; }
-        else if (res.body_ptr != null) { blen = res.body_ptr_len; }
-        if (!no_len) {
-            out.append("Content-Length: ").appendInt(blen).append("\r\n");
+
+        // A STREAMED body is framed by chunks, not by a length nobody knows
+        // yet. Refused for 204/304 and for HEAD: both mean "no body", and a
+        // HEAD that opens an endless stream is a client that hangs forever
+        // waiting for a body the method promised it would not get.
+        let streaming = res.body_src != null && !no_len && res.body_allowed;
+
+        if (streaming) {
+            out.append("Transfer-Encoding: chunked\r\n");
+        } else {
+            // A file or pointer body is framed by its own length, not by body_str.
+            let blen = res.body_str.len;
+            if (res.file_fd >= 0) { blen = res.file_len; }
+            else if (res.body_ptr != null) { blen = res.body_ptr_len; }
+            if (!no_len) {
+                out.append("Content-Length: ").appendInt(blen).append("\r\n");
+            }
         }
         if (keep) { out.append("Connection: keep-alive\r\n"); }
         else { out.append("Connection: close\r\n"); }
@@ -1705,7 +1983,9 @@ export class Server {
         // the connection: the peer reads it as the head of the next response.
         // A file body is not appended — it goes to the socket directly, after
         // these headers have left.
-        if (res.body_allowed && !no_len && res.file_fd < 0) {
+        // A streamed body appends nothing here either: the chunks follow, pulled
+        // by the connection once this head has left.
+        if (res.body_allowed && !no_len && res.file_fd < 0 && !streaming) {
             // A pointer body appends straight from its own memory: sb_append
             // already takes (ptr, len), so this is the memcpy into the output
             // buffer that body_str would have done anyway, minus the string
@@ -1735,6 +2015,43 @@ export class Server {
             }
             close(res.file_fd as i32);
             res.file_fd = -1;
+        }
+
+        // A streamed body, likewise driven to completion right here. The
+        // blocking path has no POLL_WRITE to resume on, so there is no way to
+        // hand a half-written stream back to a loop -- this pulls until the
+        // source says SRC_END.
+        //
+        // SRC_IDLE therefore means something different on this path: nothing is
+        // going to wake it, so idling is treated as the end of the body. That
+        // is what makes serveOnce() a usable test affordance for streaming
+        // (the whole suite is built on bind()/serveOnce()), and it is why a
+        // source must not rely on being asked again after saying IDLE.
+        if (res.body_src != null) {
+            let src = res.body_src;
+            res.body_src = null;
+            if (res.body_allowed && this.keep_body_for(res)) {
+                let buf = new StringBuilder(1024);
+                let guard = 0;
+                while (guard < SRC_BLOCKING_MAX_PULLS) {
+                    guard += 1;
+                    buf.clear();
+                    let verdict = src.pull(buf);
+                    let n = buf.len();
+                    if (n > SRC_MAX_CHUNK) { n = SRC_MAX_CHUNK; }
+                    if (n > 0) {
+                        let piece = new StringBuilder(n + 24);
+                        piece.append(hex_of(n)).append("\r\n");
+                        piece.appendPtr(buf.cstr() as rawptr, n);
+                        piece.append("\r\n");
+                        c.sendText(piece.toString());
+                    }
+                    if (verdict == SRC_END || verdict == SRC_IDLE) { break; }
+                }
+                c.sendText("0\r\n\r\n");
+            } else {
+                src.on_abort(ABORT_REJECTED);
+            }
         }
     }
 
@@ -1920,7 +2237,10 @@ export class Server {
                     // slots are dropped.
                     for (let f2 in 0..hi_fd + 1) {
                         let cn2 = slots[f2];
-                        if (cn2 != null) { cn2.abort_stream(ABORT_SHUTDOWN); }
+                        if (cn2 != null) {
+                            cn2.abort_stream(ABORT_SHUTDOWN);
+                            cn2.abort_source(ABORT_SHUTDOWN);
+                        }
                     }
                     break;
                 }
@@ -1946,9 +2266,17 @@ export class Server {
                 for (let f in 0..hi_fd + 1) {
                     let cn = slots[f];
                     if (cn == null) { continue; }
-                    if (now > cn.deadline) {
+                    // A connection streaming a RESPONSE is judged on its own
+                    // budget. `deadline` measures inbound silence, and an event
+                    // stream is silent inbound by design -- swept on that, every
+                    // stream would die at recv_timeout_ms (15s), which looks
+                    // like it works until something needs to outlive it.
+                    let over = now > cn.deadline;
+                    if (cn.body_src != null) { over = now > cn.src_deadline; }
+                    if (over) {
                         // A sink mid-upload is told WHY, not merely dropped.
                         cn.abort_stream(ABORT_TIMEOUT);
+                        cn.abort_source(ABORT_TIMEOUT);
                         poll.removeFd(f);
                         cn.sock.close();
                         slots[f] = null;
@@ -2020,6 +2348,8 @@ export class Server {
                     // aborted with its own reason, and abort_stream is
                     // idempotent so this cannot double-fire.
                     cn.abort_stream(ABORT_CONNECTION_LOST);
+                    // The ordinary end of an event stream: the peer left.
+                    cn.abort_source(ABORT_CONNECTION_LOST);
                     poll.removeFd(fd);
                     slots[fd] = null;
                     live -= 1;
@@ -2098,6 +2428,20 @@ export class Server {
                 close(res.file_fd as i32);
             }
             res.file_fd = -1;
+        }
+        // Same handoff for a streamed body, and the same HEAD rule: a source
+        // whose body is never going to be sent must still be told, or it holds
+        // whatever it opened for a stream that will never run.
+        if (res.body_src != null) {
+            if (res.body_allowed && this.keep_body_for(res)) {
+                cn.body_src = res.body_src;
+                cn.src_aborted = false;
+                cn.src_done = false;
+                cn.src_deadline = mono_ms() + cn.idle_budget;
+            } else {
+                res.body_src.on_abort(ABORT_REJECTED);
+            }
+            res.body_src = null;
         }
         // Recorded on the Conn: only the reactor can drop an fd from the
         // PollSet, and neither this nor drive() has access to it.
@@ -2532,6 +2876,25 @@ export class Server {
         return this.port;
     }
 
+    // Run the REACTOR on the listener bind() already opened.
+    //
+    // Test affordance, and a specific gap it fills: runSingle() opens its own
+    // listener, so `bind()` then `runSingle()` fails -- the port is already
+    // held, and it returns false with nothing to say why. That leaves no way to
+    // drive the reactor on a KNOWN port in-process, which is what a test needs
+    // to connect a client before the loop starts.
+    //
+    // serveOnce() covers the blocking path the same way. The two paths write
+    // responses through entirely different code, so a test affordance for only
+    // one of them is a test affordance for half the server.
+    //
+    // The loop runs until stop(). A caller with no other thread must arrange
+    // for something inside a handler or a BodySource to call it.
+    fn runBound(): bool {
+        if (this.listener == null) { return false; }
+        return this.reactor(this.listener, this.max_conns);
+    }
+
     // Accept and serve exactly one connection to completion, blocking.
     // Test affordance; the reactor is the real path.
     fn serveOnce(): bool {
@@ -2583,8 +2946,9 @@ export fn server(port: int): Server { return new Server(port); }
 //
 // Still missing, all core by that test:
 //
-//   * chunked bodies     — currently 501. Mis-framing is request smuggling, so
-//                          refusing beats guessing
+//   * chunked REQUEST bodies — currently 501. Mis-framing is request smuggling,
+//                          so refusing beats guessing. (Chunked RESPONSE bodies
+//                          ship: BodySource + res.sendStream, 2026-09-10.)
 //   * signals            — no SIGTERM/SIGINT handling, so stop()'s drain has no
 //                          trigger from outside the process. The self-pipe shim
 //                          this needs now EXISTS — vyto/os/reactor's

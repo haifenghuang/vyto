@@ -1,0 +1,93 @@
+// A streamed response body under the REACTOR, not serveOnce.
+//
+// 91_server.vt covers the framing, but every case there runs on the blocking
+// path — and the two paths write streams through completely different code
+// (send_response's loop versus Conn.flush/pump_source). A fault injected into
+// the reactor's terminator left all of 91_server green, which is what this
+// file exists to prevent.
+//
+// It also pins THE DEADLINE RULE. Conn.deadline measures inbound silence, and
+// an event stream is silent inbound by design; judged on that clock every
+// stream dies at recv_timeout_ms.
+//
+// Timing here is load-bearing and was got wrong once. The idle sweep runs every
+// SWEEP_INTERVAL_MS (500ms), so a stream that finishes faster than that is
+// never swept and passes with the rule DELETED — the first version of this file
+// ran ~320ms and did exactly that. The stream must outlive both the recv budget
+// AND at least one sweep, so: recv_timeout_ms 200ms, and 12 ticks at 80ms is
+// ~960ms, which crosses at least the second sweep with the budget long expired.
+
+import { server, Server, Limits, BodySource,
+         SRC_MORE, SRC_IDLE, SRC_END } from "vyto/net/server";
+import { socket_connect } from "vyto/net/socket";
+import { StringBuilder } from "vyto/util/text";
+import { monoMs } from "vyto/util/time";
+import { LOG_OFF } from "vyto/util/log";
+
+// Emits a tick every 80ms, twelve times (~960ms). Spends most of its life IDLE,
+// which is the shape a real event stream has: mostly waiting, occasionally
+// producing.
+class Ticker extends BodySource {
+    next_at: int; sent: int; aborts: int;
+    // Held so the source can stop the reactor when the body ends: the client
+    // and the server share this process, so something has to end the loop.
+    // weak, because Server holds the handler that holds this -- a strong field
+    // would close the cycle and leak under refcounting.
+    srv: weak Server;
+    fn init() { this.next_at = 0; this.sent = 0; this.aborts = 0; this.srv = null; }
+    override fn pull(out: StringBuilder): int {
+        let now = monoMs();
+        if (this.next_at == 0) { this.next_at = now; }
+        if (this.sent >= 12) {
+            let sv = this.srv;
+            if (sv != null) { sv.stop(); }
+            return SRC_END;
+        }
+        if (now < this.next_at) { return SRC_IDLE; }
+        this.sent += 1;
+        this.next_at = now + 80;
+        out.append("t").appendInt(this.sent);
+        return SRC_MORE;
+    }
+    override fn on_abort(reason: int) { this.aborts += 1; }
+}
+
+fn main() {
+    let L = new Limits();
+    // Far below the ~960ms the stream needs, and low enough that the deadline
+    // is long past by the time a sweep looks at it.
+    L.recv_timeout_ms = 200;
+
+    let tick = new Ticker();
+    let s = server(0);
+    s.withLimits(L);
+    // The drain banner is INFO and would land in the golden output, where its
+    // timestamp makes it unmatchable.
+    s.withDrainMs(200);
+    s.log.level(LOG_OFF);
+    s.withHandler((req, res) => { res.sendStream(200, tick); });
+    tick.srv = s;
+    // bind() first so the ephemeral port is known before a client exists.
+    // runSingle() reuses it, since bind() wrote the resolved port back onto the
+    // server -- it does NOT pick a second one.
+    let port = s.bind();
+
+    // Connect BEFORE the reactor runs. The connection sits in the accept queue
+    // until runSingle() picks it up, so there is nothing to synchronise and no
+    // sleep anywhere in this file.
+    let c = socket_connect("127.0.0.1", port);
+    c.setTimeoutMs(5000);
+    c.sendText("GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+
+    // The REACTOR, not serveOnce. Ticker stop()s the server on SRC_END, so this
+    // returns once the body is complete.
+    s.runBound();
+    let r = c.recvText(65536);
+    c.close();
+
+    print("chunked=" + str(r.contains("Transfer-Encoding: chunked")));
+    print("ticks=" + str(tick.sent));
+    print("all_present=" + str(r.contains("t1") && r.contains("t12")));
+    print("terminated=" + str(r.contains("0\r\n\r\n")));
+    print("no_abort=" + str(tick.aborts == 0));
+}

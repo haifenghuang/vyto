@@ -15,9 +15,34 @@
 // in response header values (response splitting), and `Transfer-Encoding` is
 // refused outright rather than mis-framed (request smuggling).
 
-import { server, Server, Limits } from "vyto/net/server";
+import { server, Server, Limits, BodySource,
+         SRC_MORE, SRC_IDLE, SRC_END } from "vyto/net/server";
 import { socket_connect } from "vyto/net/socket";
 import { StringBuilder } from "vyto/util/text";
+
+// A source with a fixed number of pieces, and a record of whether it was told
+// the stream died. Both halves are asserted below.
+class Counted extends BodySource {
+    pulls: int; limit: int; aborts: int; reason: int;
+    fn init(limit: int) {
+        this.pulls = 0; this.limit = limit; this.aborts = 0; this.reason = 0;
+    }
+    override fn pull(out: StringBuilder): int {
+        if (this.pulls >= this.limit) { return SRC_END; }
+        this.pulls += 1;
+        out.append("evt").appendInt(this.pulls);
+        return SRC_MORE;
+    }
+    override fn on_abort(reason: int) { this.aborts += 1; this.reason = reason; }
+}
+
+// Never produces. On the blocking path SRC_IDLE ends the body, because nothing
+// is going to wake it there.
+class NeverReady extends BodySource {
+    pulls: int;
+    fn init() { this.pulls = 0; }
+    override fn pull(out: StringBuilder): int { this.pulls += 1; return SRC_IDLE; }
+}
 
 fn expect(name: string, hay: string, needle: string) {
     if (hay.contains(needle)) { print("PASS " + name); }
@@ -218,6 +243,85 @@ fn main() {
     // NUL, so `/a%00b` would otherwise silently become `/a`.
     expect("pct_nul_400", round_trip(pp,
         "GET /a%00b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", p), "400");
+
+    // ---- streamed response bodies ----------------------------------------
+    //
+    // A body whose length is not known when the head is sent, framed with
+    // Transfer-Encoding: chunked. What makes this worth asserting rather than
+    // eyeballing is that a mis-framed chunk stream does not look broken -- it
+    // desynchronises the connection, and the NEXT response is what fails.
+
+    let three = new Counted(3);
+    let head_src = new Counted(3);
+    let n204 = new Counted(3);
+    let idle = new NeverReady();
+
+    let sp = server(0);
+    sp.withHandler((req, res) => {
+        let path = req.path();
+        if (path == "/stream") { res.sendStream(200, three); return; }
+        if (path == "/head")   { res.sendStream(200, head_src); return; }
+        if (path == "/204")    { res.sendStream(204, n204); return; }
+        if (path == "/idle")   { res.sendStream(200, idle); return; }
+        res.text(200, "AFTER");
+    });
+    let spp = sp.bind();
+
+    let st = round_trip(spp, "GET /stream HTTP/1.1\r\nHost: x\r\n"
+                             + "Connection: close\r\n\r\n", sp);
+    expect("stream_is_chunked", st, "Transfer-Encoding: chunked");
+    // Both framings at once would be a smuggling primitive, not a redundancy.
+    if (!st.contains("Content-Length")) { print("PASS stream_has_no_content_length"); }
+    else { print("FAIL stream_has_no_content_length"); }
+    // Byte-exact, including the terminator. A test that accepts "some chunks
+    // arrived" passes with the framing subtly wrong.
+    expect("stream_frames_exactly", st,
+        "4\r\nevt1\r\n4\r\nevt2\r\n4\r\nevt3\r\n0\r\n\r\n");
+
+    // HEAD promised no body, so the stream must not start -- and the source is
+    // TOLD, or it holds whatever it opened for a body that will never run.
+    let hd = round_trip(spp, "HEAD /head HTTP/1.1\r\nHost: x\r\n"
+                             + "Connection: close\r\n\r\n", sp);
+    if (!hd.contains("Transfer-Encoding")) { print("PASS head_refuses_a_stream"); }
+    else { print("FAIL head_refuses_a_stream"); }
+    if (head_src.aborts == 1 && head_src.pulls == 0) {
+        print("PASS head_source_is_told");
+    } else { print("FAIL head_source_is_told"); }
+
+    // 204 says "no body" in the framing itself.
+    let r204 = round_trip(spp, "GET /204 HTTP/1.1\r\nHost: x\r\n"
+                               + "Connection: close\r\n\r\n", sp);
+    if (!r204.contains("Transfer-Encoding")) { print("PASS status204_refuses_a_stream"); }
+    else { print("FAIL status204_refuses_a_stream"); }
+    if (n204.aborts == 1) { print("PASS status204_source_is_told"); }
+    else { print("FAIL status204_source_is_told"); }
+
+    // A source that never produces must not spin. On the blocking path there is
+    // nothing to wake it, so SRC_IDLE ends the body rather than looping.
+    let ri = round_trip(spp, "GET /idle HTTP/1.1\r\nHost: x\r\n"
+                             + "Connection: close\r\n\r\n", sp);
+    expect("idle_source_terminates", ri, "0\r\n\r\n");
+    if (idle.pulls <= 2) { print("PASS idle_source_does_not_spin"); }
+    else { print("FAIL idle_source_does_not_spin"); }
+
+    // THE ONE THAT MATTERS: chunked framing exists so the connection survives.
+    // A stream then a normal request down one socket -- if the terminator or a
+    // chunk length is wrong, the second reply never parses.
+    let two = new Counted(2);
+    let sk = server(0);
+    sk.withHandler((req, res) => {
+        if (req.path() == "/s") { res.sendStream(200, two); return; }
+        res.text(200, "AFTER");
+    });
+    let skp = sk.bind();
+    let c2 = socket_connect("127.0.0.1", skp);
+    c2.setTimeoutMs(3000);
+    c2.sendText("GET /s HTTP/1.1\r\nHost: x\r\n\r\n"
+                + "GET /after HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    sk.serveOnce();
+    let both = c2.recvText(65536);
+    c2.close();
+    expect("connection_survives_a_stream", both, "AFTER");
 
     print("done");
 }

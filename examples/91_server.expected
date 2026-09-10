@@ -31,4 +31,14 @@ PASS hdr_space_before_colon_400
 PASS pct_dots_normalised
 PASS dot_segments_normalised
 PASS pct_nul_400
+PASS stream_is_chunked
+PASS stream_has_no_content_length
+PASS stream_frames_exactly
+PASS head_refuses_a_stream
+PASS head_source_is_told
+PASS status204_refuses_a_stream
+PASS status204_source_is_told
+PASS idle_source_terminates
+PASS idle_source_does_not_spin
+PASS connection_survives_a_stream
 done

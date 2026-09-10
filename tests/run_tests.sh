@@ -758,6 +758,31 @@ else
     fail=1
 fi
 
+# --- a streamed response body, under the REACTOR ---
+#
+# 91_server covers the framing on the BLOCKING path. The two paths write a
+# stream through entirely different code, and a fault injected into the
+# reactor's terminator left all of 91_server green -- which is what this exists
+# to catch.
+#
+# WRAPPED IN timeout, deliberately. Removing the rule that judges a streaming
+# connection on its own deadline gets it swept mid-body, and the client then
+# waits forever for bytes that stop arriving: the failure is a HANG, not a red
+# assertion. A CI job without the wrapper would stall instead of reporting.
+got=$(timeout 60 ./vytoc run tests/fixtures/server_stream_reactor.vt 2>&1)
+rc=$?
+if [ "$rc" -eq 124 ]; then
+    echo "FAIL server_stream_reactor (TIMED OUT -- a stream was swept mid-body?)"
+    fail=1
+elif [ "$got" = "$(cat tests/fixtures/server_stream_reactor.expected)" ]; then
+    echo "PASS server_stream_reactor"
+else
+    echo "FAIL server_stream_reactor"
+    echo "--- expected ---"; cat tests/fixtures/server_stream_reactor.expected
+    echo "--- got ---"; printf '%s\n' "$got"
+    fail=1
+fi
+
 # --- vyto/os/reactor: the self-pipe wakeup and signal routing ---
 got=$(./vytoc run tests/fixtures/reactor_wakeup.vt 2>&1)
 if [ "$got" = "$(cat tests/fixtures/reactor_wakeup.expected)" ]; then
